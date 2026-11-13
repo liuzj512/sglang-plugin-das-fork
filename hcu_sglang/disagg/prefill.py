@@ -57,6 +57,7 @@ from hcu_sglang.disagg.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    _all_reduce_polls,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
@@ -111,7 +112,7 @@ from sglang.srt.runtime_context import (
 from hcu_sglang.speculative_disaggregation import (
     resolve_hidden_bootstrap_plan,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_npu, rank_consensus_checker
 from hcu_sglang.utils.detection import is_hcu
 
 if TYPE_CHECKING:
@@ -2205,10 +2206,11 @@ class SchedulerDisaggregationPrefillMixin:
                         emit_response=True,
                     )
                     req.pending_bootstrap = False
+                    # Always enqueue: cleanup_done is rank-local, queue membership must not be.
+                    if req not in self.disagg_prefill_inflight_queue:
+                        self.disagg_prefill_inflight_queue.append(req)
                     if cleanup_done:
                         req.time_stats.set_completion_time()
-                    elif req not in self.disagg_prefill_inflight_queue:
-                        self.disagg_prefill_inflight_queue.append(req)
                     advance_logprob_pt(i, req)
                     continue
 
@@ -2234,6 +2236,10 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 if is_aborted(req) or is_pd_hidden_transfer_failed(req):
+                    # An abort that lands while the probe is inside this forward only sets to_finish; a fake
+                    # sender then stays WaitingForInput forever and pins the queue (flush_cache -> 400).
+                    if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
+                        req.disagg_kv_sender.abort()
                     self.disagg_prefill_inflight_queue.append(req)
                     req.time_stats.set_prefill_transfer_queue_entry_time()
                     advance_logprob_pt(i, req)
@@ -2424,6 +2430,9 @@ class SchedulerDisaggregationPrefillMixin:
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+            if req.external_kv_cleanup_done and req.external_kv_response_sent:
+                done_reqs.append(req)
+                continue
             # Check if this request was marked for external KV abort
             external_abort_pending = req.rid in self._external_kv_abort_rids
 
@@ -2551,6 +2560,36 @@ class SchedulerDisaggregationPrefillMixin:
                 raise RuntimeError(
                     f"Unexpected poll state {poll} for req {req.rid} in inflight queue"
                 )
+
+        # Removal must be collective. Ranks finish a failed/aborted request's cleanup on different passes (rank 0, the
+        # only real sender, first; dummy CP ranks later). A rank that drops it early sees an empty queue, returns before
+        # the poll all_reduce above and the ranks still holding it block there forever.
+        queue_order = list(self.disagg_prefill_inflight_queue)
+        done_ids = {id(r) for r in done_reqs}
+        flags = [int(id(r) in done_ids) for r in queue_order]
+        flags = _all_reduce_polls(flags, self.attn_tp_cpu_group)
+        flags = _all_reduce_polls(flags, self.attn_cp_cpu_group)
+        keep_ids = {id(r) for r, f in zip(queue_order, flags) if not f}
+        done_reqs = [r for r in done_reqs if id(r) not in keep_ids]
+        undone_reqs = [r for r in queue_order if id(r) in keep_ids]
+        held = getattr(self, "_inflight_held_since", None)
+        if held is None:
+            held = self._inflight_held_since = {}
+        now = time.monotonic()
+        for r in undone_reqs:
+            if r.external_kv_abort_requested and not r.external_kv_cleanup_done:
+                if now - held.setdefault(r.rid, now) > 60:
+                    held[r.rid] = now  # re-arm: at most one warning a minute per request
+                    logger.warning(
+                        f"inflight request {r.rid[:8]} not cleaned up on rank {self.ps.tp_rank} for over 60s"
+                    )
+        for rid in held.keys() - {r.rid for r in undone_reqs}:
+            del held[rid]
+        rank_consensus_checker.assert_same(
+            "pd prefill inflight queue after consensus: done=%d kept=%d",
+            len(done_reqs),
+            len(undone_reqs),
+        )
 
         for req in done_reqs:
             req.time_stats.set_completion_time()
@@ -2728,7 +2767,7 @@ class SchedulerDisaggregationPrefillMixin:
             req.to_finish = FINISH_ABORT(
                 error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
-        cleanup_done = self.abort_external_kv_request(
+        self.abort_external_kv_request(
             req,
             forward_drained=self.prefill_abort_forward_drained(req),
             sender_terminal=self.prefill_abort_sender_terminal(req),
@@ -2736,7 +2775,7 @@ class SchedulerDisaggregationPrefillMixin:
             is_insert=False,
             emit_response=True,
         )
-        if not cleanup_done and req not in self.disagg_prefill_inflight_queue:
+        if req not in self.disagg_prefill_inflight_queue:
             # The bootstrap/waiting queue removes this request after the call.
             # Keep a strong reference, not just a RID, for the next cleanup pass.
             self.disagg_prefill_inflight_queue.append(req)
