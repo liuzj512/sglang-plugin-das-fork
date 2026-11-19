@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import ast
@@ -6,6 +9,8 @@ import hashlib
 import json
 from pathlib import Path
 import unittest
+
+from tools.build_migration_manifest import node_hash
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,9 +25,7 @@ class RuntimeTriageTests(unittest.TestCase):
         for row in manifest["files"]:
             with self.subTest(source=row["source"]):
                 tree = ast.parse((ROOT / row["owned"]).read_text())
-                digest = hashlib.sha256(
-                    ast.dump(tree, include_attributes=False).encode()
-                ).hexdigest()
+                digest = node_hash(tree)
                 self.assertEqual(digest, row["source_ast_sha256"])
                 self.assertEqual(digest, row["owned_ast_sha256"])
                 self.assertTrue(row["callers"])
@@ -44,12 +47,34 @@ class RuntimeTriageTests(unittest.TestCase):
                 with self.subTest(source=row["source"], definition=item["source"]):
                     candidates = definitions[item["owned"].rsplit(".", 1)[-1]]
                     digests = {
-                        hashlib.sha256(
-                            ast.dump(node, include_attributes=False).encode()
-                        ).hexdigest()
+                        node_hash(node)
                         for node in candidates
                     }
                     self.assertIn(item["ast_sha256"], digests)
+
+    def test_ast_hash_ignores_only_empty_type_parameter_metadata(self):
+        tree = ast.parse("def example(value):\n    return value + 1\n")
+        node = tree.body[0]
+        fields = node._fields
+        if "type_params" not in fields:
+            node._fields = (*fields, "type_params")
+        node.type_params = []
+        expected = node_hash(tree)
+        self.assertIn("type_params", node._fields)
+        self.assertEqual(node.type_params, [])
+        node.type_params = [ast.Name(id="T", ctx=ast.Load())]
+        self.assertNotEqual(node_hash(tree), expected)
+        node.type_params = []
+        changed = ast.parse("def example(value):\n    return value + 2\n")
+        self.assertNotEqual(node_hash(changed), expected)
+
+    def test_ast_hash_matches_the_legacy_non_generic_schema(self):
+        node = ast.parse("def example(value):\n    return value + 1\n")
+        for child in ast.walk(node):
+            if getattr(child, "type_params", None) == []:
+                child._fields = tuple(field for field in child._fields if field != "type_params")
+        expected = hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest()
+        self.assertEqual(node_hash(ast.parse("def example(value):\n    return value + 1\n")), expected)
 
     def test_triage_has_1464_unique_rows_and_explicit_exclusions(self):
         with (ROOT / "plans/hcu-runtime-triage-20261105.csv").open() as stream:

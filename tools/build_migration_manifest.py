@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import copy
 import difflib
 import hashlib
 import json
@@ -83,6 +84,10 @@ def blob(repo: Path, revision: str, path: str) -> str | None:
 
 
 def node_hash(node: ast.AST) -> str:
+    node = copy.deepcopy(node)
+    for child in ast.walk(node):
+        if getattr(child, "type_params", None) == []:
+            child._fields = tuple(field for field in child._fields if field != "type_params")
     value = ast.dump(node, include_attributes=False)
     return hashlib.sha256(value.encode()).hexdigest()
 
