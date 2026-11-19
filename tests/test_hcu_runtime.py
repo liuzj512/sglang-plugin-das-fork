@@ -19,7 +19,10 @@ ROOT = Path(__file__).resolve().parents[1]
 class HcuRuntimeTests(unittest.TestCase):
     def test_cold_import_keeps_startup_lightweight_and_uses_current_namespace(self):
         code = "import hcu_sglang,sys,json; print(json.dumps({'file':hcu_sglang.__file__,'loaded':[n for n in sys.modules if n.split('.')[0] in ['torch','aiter','sglang_hcu_plugin']]}))"
-        report = json.loads(subprocess.check_output([sys.executable, '-c', code], cwd=ROOT, text=True))
+        report = json.loads(subprocess.check_output(
+            [sys.executable, '-S', '-c', code], cwd=ROOT, text=True,
+            env={**os.environ, 'PYTHONPATH': str(ROOT)},
+        ))
         self.assertTrue(Path(report['file']).is_relative_to(ROOT / 'hcu_sglang'))
         self.assertEqual(report['loaded'], [])
 
@@ -69,6 +72,7 @@ import sys
 import types
 module = types.ModuleType('sglang.srt.arg_groups.arg_utils')
 module.is_record = lambda cls: False
+module.field_names = lambda cls: set(getattr(cls, '__annotations__', {}))
 sys.modules[module.__name__] = module
 from hcu_sglang.server_args import ensure_choices
 from hcu_sglang.layers.quantization.registry import _HCU_QUANTIZATION_NAMES
@@ -92,7 +96,8 @@ assert parser.parse_args(['--quantization', 'fp8']).quantization == 'fp8'
 assert 'torch' not in sys.modules
 assert not any(name.endswith('slimquant_w4a8_marlin') for name in sys.modules)
 """
-        result = subprocess.run([sys.executable, '-c', code], cwd=ROOT,
+        result = subprocess.run([sys.executable, '-S', '-c', code], cwd=ROOT,
+                                env={**os.environ, 'PYTHONPATH': str(ROOT)},
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

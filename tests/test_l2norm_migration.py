@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import ast
@@ -5,6 +8,8 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import sys
+from types import ModuleType
 import unittest
 from unittest.mock import patch
 
@@ -79,7 +84,6 @@ class L2NormMigrationTests(unittest.TestCase):
     def test_vendor_branch_calls_the_cuda_operator_and_restores_shape(self):
         loader = importlib.util.spec_from_file_location("l2norm_vendor_probe", OWNED)
         module = importlib.util.module_from_spec(loader)
-        loader.loader.exec_module(module)
 
         class FakeTensor:
             shape = (4, 8)
@@ -106,7 +110,13 @@ class L2NormMigrationTests(unittest.TestCase):
             seen.append((x, eps))
             return x
 
-        with patch.object(module, "_has_l2norm_cuda", True), patch.object(module, "_l2norm_cuda", fake_op):
+        vendor = ModuleType('sgl_kernel')
+        vendor.l2norm = fake_op
+        with patch.dict(sys.modules, {'sgl_kernel': vendor}):
+            loader.loader.exec_module(module)
+        self.assertTrue(module._has_l2norm_cuda)
+        self.assertIs(module._l2norm_cuda, fake_op)
+        with patch.object(module, "_l2norm_cuda", fake_op):
             result = module.l2norm_fwd(tensor, 1e-6)
 
         self.assertIs(result, tensor)
